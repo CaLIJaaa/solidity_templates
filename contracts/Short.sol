@@ -2,102 +2,69 @@
 
 pragma solidity ^0.8.20;
 
-import "../vertex-contracts/contracts/interfaces/IEndpoint.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "gmx-synthetics/contracts/router/IExchangeRouter.sol";
+import "gmx-synthetics/contracts/gas/GasUtils.sol";
+import "gmx-synthetics/contracts/order/IBaseOrderUtils.sol";
+import "gmx-synthetics/contracts/order/Order.sol";
+import "gmx-synthetics/contracts/token/IWNT.sol";
 
-interface IEndpointExtended is IEndpoint {
-    function executeSlowModeTransaction() external;
-}
+contract createShortPosition { //arbitrum sepolia
+    IExchangeRouter public exchangeRouter = IExchangeRouter(0xbbb774b00102e2866677b9d238b2Ee489779E532);
+    IERC20 public usdcToken = IERC20(0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d); //Возиожно надо заменить на другой
+    address public ethUsdMarket; // адрес ETH рынка на GMX
+    IWNT public wntToken = IWNT(0xf7a20c37ca3612ac7a1de704114064b8b211d593); //wnt - wrapped native token (в нашем случае это wETH)
+    //! не уверен что указал правильный адрес для wntToken
+    address public orderVault = 0xD2A2044f62D7cD77470AC237408f9f59AcB5965E;
 
-contract createDeposit {
-    struct LinkSigner {
-        bytes32 sender;
-        bytes32 signer;
-        uint64 nonce;
-    }
+    function openShortPosition(
+        uint256 amountUSDC, // t - сумма USDC для залога
+        uint256 leverage,   // n - плечо
+        uint256 acceptablePrice // приемлемая цена для контроля проскальзывания
+    ) external payable {
+        // Пользователь должен предварительно одобрить перевод USDC нашему контракту
+        require(usdcToken.transferFrom(msg.sender, address(this), amountUSDC), "Transfer failed");
 
-    struct SwapAMM {
-        bytes32 sender;
-        uint32 productId;
-        int128 amount;
-        int128 priceX18;
-    }
+        // Одобряем ExchangeRouter тратить USDC от имени нашего контракта
+        usdcToken.approve(address(exchangeRouter), amountUSDC);
 
-    address USDC20 = 0xD32ea1C76ef1c296F131DD4C5B2A0aac3b22485a;
-    IEndpointExtended endpointInterface =
-        IEndpointExtended(0xaDeFDE1A14B6ba4DA3e82414209408a49930E8DC);
+        // Подготавливаем параметры для createOrder
+        IBaseOrderUtils.CreateOrderParams memory params;
 
-    receive() external payable {}
+        params.addresses = IBaseOrderUtils.CreateOrderParamsAddresses({
+            receiver: msg.sender, // Получатель выходных сумм
+            cancellationReceiver: msg.sender, // Получатель при отмене ордера
+            callbackContract: address(0), // Не используем callback
+            uiFeeReceiver: address(0), // Не берем UI комиссию (можно настроить так чтобы нам приносило это прибыль)
+            market: ethUsdMarket, // Рынок ETH/USD (надо его как-то достать, пока не разобрался как)
+            initialCollateralToken: address(usdcToken), // USDC как залог
+            swapPath: [] // Пустой массив, т.к. обмен не требуется (мы просто купим eth за usdc)
+        });
 
-    function depositUSDC(uint256 amount) external {
-        require(amount > 0, "Amount must be greater than zero");
+        params.numbers = IBaseOrderUtils.CreateOrderParamsNumbers({
+            sizeDeltaUsd: amountUSDC * leverage, // Размер позиции в USD
+            initialCollateralDeltaAmount: amountUSDC, // Сумма залога USDC
+            triggerPrice: 0, // Для рыночного ордера устанавливаем 0
+            acceptablePrice: acceptablePrice, // Приемлемая цена
+            executionFee: GasUtils.estimateExecuteOrderGasLimit, // Минимальная комиссия за исполнение
+            callbackGasLimit: 0, // Не используем callback
+            minOutputAmount: 0, // Нет обмена, можно установить 0
+            validFromTime: 0 // Ордер действителен сразу
+        });
 
-        // Выполняем transferFrom от отправителя к контракту
-        bool success = ERC20(USDC20).transferFrom(
-            msg.sender,
-            address(this),
-            amount
-        );
-        require(success, "USDC transfer failed");
-    }
+        params.orderType = Order.OrderType.MarketIncrease; // Рыночный ордер на увеличение позиции
+        params.isLong = false; // Открываем короткую позицию
+        params.shouldUnwrapNativeToken = false; // Не разворачиваем нативный токен
+        params.autoCancel = false; // Не используется для этого типа ордера
+        params.referralCode = bytes32(0); // Если есть реферальный код, можно установить
 
-    function linkVertexSigner(
-        address externalAccount,
-        address usdcAddress
-    ) external {
-        // 1. a slow mode fee of 1 USDC needs to be avaliable and approved
-        ERC20 usdcToken = ERC20(usdcAddress);
+        // Определяем сумму комиссии за исполнение в ETH
+        uint256 executionFee = params.numbers.executionFee;
+        require(msg.value >= executionFee, "Insufficient ETH for execution fee");
+        wntToken.deposit{value: executionFee}();
+        wntToken.approve(address(exchangeRouter), executionFee);
 
-        // NOTE: should double check the USDC decimals in the corresponding chain.
-        // e.g: it's 1e6 on arbitrum, whereas it's 1e18 on blast, etc.
-        // on base it's 1e6
-        uint256 SLOW_MODE_FEE = 1e6;
-        usdcToken.approve(address(endpointInterface), SLOW_MODE_FEE);
-
-        // 2. assamble the link signer slow mode transaction
-        bytes12 defaultSubaccountName = bytes12(abi.encodePacked("default"));
-        bytes32 contractSubaccount = bytes32(
-            abi.encodePacked(uint160(address(this)), defaultSubaccountName)
-        );
-        bytes32 externalSubaccount = bytes32(
-            uint256(uint160(externalAccount)) << 96
-        );
-        LinkSigner memory linkSigner = LinkSigner(
-            contractSubaccount,
-            externalSubaccount,
-            endpointInterface.getNonce(externalAccount)
-        );
-        bytes memory txs = abi.encodePacked(uint8(19), abi.encode(linkSigner));
-
-        // 3. submit slow mode transaction
-        endpointInterface.submitSlowModeTransaction(txs);
-    }
-
-    function createShort(address usdcAddress) external {
-        ERC20 usdcToken = ERC20(usdcAddress);
-        usdcToken.approve(address(endpointInterface), 9999999999999999999);
-
-        bytes12 defaultSubaccountName = bytes12(abi.encodePacked("default"));
-        bytes32 contractSubaccount = bytes32(
-            abi.encodePacked(uint160(address(this)), defaultSubaccountName)
-        );
-
-        uint32 productId = uint32(4);
-        int128 amount = int128(10 ** 16);
-
-        SwapAMM memory SwapAMM = SwapAMM(
-            contractSubaccount,
-            productId, //id для perp ETH
-            amount,
-            endpointInterface.getPriceX18(productId)
-        );
-
-        bytes memory txs = abi.encodePacked(uint8(11), abi.encode(SwapAMM));
-
-        endpointInterface.submitSlowModeTransaction(txs);
-    }
-
-    function executeTransaction() external {
-        endpointInterface.executeSlowModeTransaction();
+        //тут надо создать список транзакций которые будут по очереди выполняться, надо отправить деньги на OrderVault
+        // и после вызвать функцию createOrder(), все это надо выполнить через exchangeRouter.multicall(txs); чтобы всё дошло
     }
 }
