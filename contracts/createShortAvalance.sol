@@ -13,6 +13,11 @@ interface IERC20 {
     function allowance(address owner, address spender) external view returns (uint256);
 }
 
+interface IWAVAX {
+    function deposit() external payable;
+    function withdraw(uint256) external;
+}
+
 
 struct OrderParams {
     address receiver;
@@ -37,12 +42,18 @@ struct OrderParams {
 contract createShort {
     IExchangeRouter public exchangeRouter;
     IERC20 public usdc;
+    IWAVAX public wavax;
     address public orderVault;
 
-    constructor(address _exchangeRouter, address _usdc, address _orderVault) {
+    constructor(address _exchangeRouter, address _usdc, address _wavax, address _orderVault) {
         exchangeRouter = IExchangeRouter(_exchangeRouter);
         usdc = IERC20(_usdc);
+        wavax = IWAVAX(_wavax);
         orderVault = _orderVault;
+    }
+
+    function wrapAvax() public payable {
+        wavax.deposit{value: msg.value}();
     }
 
     function createShortPosition(
